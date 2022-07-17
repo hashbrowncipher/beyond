@@ -1,0 +1,6 @@
+name: beyond
+runtime:
+  name: python
+  options:
+    virtualenv: venv
+description: Cloudfront BeyondCorp...

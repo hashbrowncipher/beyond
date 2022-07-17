@@ -1,0 +1,7 @@
+config:
+  aws:region: us-west-2
+  beyond:client_id: 0oa5tbbufynPxwc6I5d7
+  beyond:client_secret:
+    secure: AAABADUSOcx4X/rL5n3/j/bNqOKh+hVw6HFVJQ49YRAPWGKN0N9ufKAE2SEM9bhURn3UgepZrqm+Tx+omUyeWR8cNruM6axU
+  beyond:jwks_uri: /oauth2/default/v1/keys
+  beyond:token_uri: /oauth2/default/v1/token
