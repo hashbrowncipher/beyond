@@ -2,22 +2,19 @@
 import json
 
 import pulumi
-from pulumi_random import RandomPassword
+from pulumi import Output
 from pulumi_random import RandomString
 import pulumi_aws as aws
 from pulumi_aws import iam
 from pulumi_aws import lambda_
 from pulumi_aws import s3
-from pulumi_aws import cloudfront
+from pulumi_aws import dynamodb
 
 useast1 = aws.Provider("useast1", region="us-east-1")
 
 config = pulumi.Config()
 
 bucket_name = RandomString("bucket", length=16, special=False, upper=False)
-
-# log_2(62^22) is 131 bits of entropy
-hmac_secret = RandomPassword("hmac_secret", length=22, special=False)
 
 
 def arp(allowed_services):
@@ -70,25 +67,15 @@ def s3_bucket(identifier, name):
     return bucket
 
 
-bucket = s3_bucket("bucket", bucket_name)
+def output_kwargs(fn):
+    def wrapper(args):
+        return fn(**args)
+
+    return wrapper
 
 
-def make_function_code(hmac_secret):
-    config = dict(hmac_secret=hmac_secret)
-    code = "var config = {};\n".format(json.dumps(config))
-    code += open("verify-jwt.js", "r").read()
-    return code
-
-
-verifier = cloudfront.Function(
-    "verifier",
-    publish=True,
-    runtime="cloudfront-js-1.0",
-    code=hmac_secret.result.apply(make_function_code),
-)
-
-
-def make_archive(hmac_secret):
+@output_kwargs
+def make_archive(tokens_table, bucket):
     config_ini = pulumi.StringAsset(
         f"""\
 [default]
@@ -97,7 +84,8 @@ jwks_uri = {config.require("jwks_uri")}
 token_uri = {config.require("token_uri")}
 client_id = {config.require("client_id")}
 client_secret = {config.require("client_secret")}
-hmac_secret = {hmac_secret}
+tokens_table = {tokens_table}
+bucket = {bucket}
 """
     )
 
@@ -110,106 +98,86 @@ hmac_secret = {hmac_secret}
     )
 
 
-def make_issuer():
+def _iam_policy(statements):
+    return json.dumps(dict(Version="2012-10-17", Statement=statements))
+
+
+@output_kwargs
+def _lambda_policy(*, tokens_arn, bucket_arn):
+    statements = [
+        dict(
+            Action=["dynamodb:PutItem", "dynamodb:GetItem"],
+            Effect="Allow",
+            Resource=[tokens_arn],
+        ),
+        dict(
+            Effect="Allow",
+            Action="logs:CreateLogGroup",
+            Resource="arn:aws:logs:us-east-1:624142562444:*",
+        ),
+        dict(
+            Effect="Allow",
+            Action=[
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+            ],
+            Resource=[
+                "arn:aws:logs:us-east-1:624142562444:log-group:/aws/lambda/issuer-*:*"
+            ],
+        ),
+        dict(
+            Effect="Allow",
+            Action=["s3:GetObject", "s3:ListBucket"],
+            Resource=[
+                bucket_arn,
+                bucket_arn + ":*",
+            ],
+        ),
+    ]
+    return _iam_policy(statements)
+
+
+def make_issuer(tokens, bucket):
+    outputs = Output.all(tokens_arn=tokens.arn, bucket_arn=bucket.arn)
     role = iam.Role(
         "lambda",
-        assume_role_policy=arp(["lambda.amazonaws.com", "edgelambda.amazonaws.com"]),
+        assume_role_policy=arp(["lambda.amazonaws.com"]),
+        inline_policies=[
+            aws.iam.RoleInlinePolicyArgs(
+                name="policy",
+                policy=outputs.apply(_lambda_policy),
+            )
+        ],
     )
 
-    # TODO: don't use lambda@edge for this?
-    return lambda_.Function(
+    function = lambda_.Function(
         "issuer",
-        pulumi.ResourceOptions(provider=useast1),
         role=role.arn,
         runtime="python3.9",
         handler="lambda_function.lambda_handler",
-        code=hmac_secret.result.apply(make_archive),
+        timeout=60,
+        code=Output.all(tokens_table=tokens.id, bucket=bucket.bucket).apply(
+            make_archive
+        ),
         publish=True,
     )
 
+    lambda_.FunctionUrl(
+        "issuer", function_name=function.name, authorization_type="NONE"
+    )
 
-issuer = make_issuer()
 
-
-cloudfront.Distribution(
-    "internal-services",
-    origins=[
-        cloudfront.DistributionOriginArgs(
-            domain_name=bucket.bucket_regional_domain_name,
-            origin_id="s3",
+bucket = s3_bucket("bucket", bucket_name)
+tokens = dynamodb.Table(
+    "tokens2",
+    name="tokens",
+    attributes=[
+        dynamodb.TableAttributeArgs(
+            name="hashed_token",
+            type="B",
         )
     ],
-    enabled=True,
-    restrictions=cloudfront.DistributionRestrictionsArgs(
-        geo_restriction=cloudfront.DistributionRestrictionsGeoRestrictionArgs(
-            restriction_type="none"
-        )
-    ),
-    price_class="PriceClass_100",
-    ordered_cache_behaviors=[
-        cloudfront.DistributionOrderedCacheBehaviorArgs(
-            path_pattern="/auth",
-            allowed_methods=[
-                "GET",
-                "HEAD",
-                "OPTIONS",
-            ],
-            cached_methods=[
-                "GET",
-                "HEAD",
-                "OPTIONS",
-            ],
-            target_origin_id="s3",
-            lambda_function_associations=[
-                cloudfront.DistributionOrderedCacheBehaviorLambdaFunctionAssociationArgs(
-                    event_type="viewer-request",
-                    lambda_arn=issuer.qualified_arn,
-                    include_body=False,
-                )
-            ],
-            forwarded_values=cloudfront.DistributionOrderedCacheBehaviorForwardedValuesArgs(
-                query_string=False,
-                cookies=cloudfront.DistributionOrderedCacheBehaviorForwardedValuesCookiesArgs(
-                    forward="none",
-                ),
-            ),
-            viewer_protocol_policy="redirect-to-https",
-        )
-    ],
-    default_cache_behavior=cloudfront.DistributionDefaultCacheBehaviorArgs(
-        allowed_methods=[
-            "DELETE",
-            "GET",
-            "HEAD",
-            "OPTIONS",
-            "PATCH",
-            "POST",
-            "PUT",
-        ],
-        cached_methods=[
-            "GET",
-            "HEAD",
-        ],
-        target_origin_id="s3",
-        function_associations=[
-            cloudfront.DistributionDefaultCacheBehaviorFunctionAssociationArgs(
-                event_type="viewer-request",
-                function_arn=verifier.arn,
-            )
-        ],
-        forwarded_values=cloudfront.DistributionDefaultCacheBehaviorForwardedValuesArgs(
-            query_string=True,
-            cookies=cloudfront.DistributionDefaultCacheBehaviorForwardedValuesCookiesArgs(
-                forward="none",
-            ),
-        ),
-        viewer_protocol_policy="redirect-to-https",
-        min_ttl=0,
-        default_ttl=0,
-        max_ttl=0,
-    ),
-    viewer_certificate=cloudfront.DistributionViewerCertificateArgs(
-        cloudfront_default_certificate=True,
-    ),
-    wait_for_deployment=False,
+    billing_mode="PAY_PER_REQUEST",
+    hash_key="hashed_token",
 )
+issuer = make_issuer(tokens, bucket)
