@@ -51,6 +51,7 @@ def s3_bucket(identifier, name):
                 apply_server_side_encryption_by_default=s3.BucketServerSideEncryptionConfigurationV2RuleApplyServerSideEncryptionByDefaultArgs(
                     sse_algorithm="AES256",
                 ),
+                bucket_key_enabled=True,
             )
         ],
     )
@@ -130,7 +131,7 @@ def _lambda_policy(*, tokens_arn, bucket_arn):
             Action=["s3:GetObject", "s3:ListBucket"],
             Resource=[
                 bucket_arn,
-                bucket_arn + ":*",
+                bucket_arn + "/*",
             ],
         ),
     ]
@@ -154,6 +155,9 @@ def make_issuer(tokens, bucket):
         "issuer",
         role=role.arn,
         runtime="python3.9",
+        # arm64 is noticeably slower, and not in a small way.
+        # it's the difference between 500 microseconds and 500 milliseconds
+        architectures=["x86_64"],
         handler="lambda_function.lambda_handler",
         timeout=60,
         code=Output.all(tokens_table=tokens.id, bucket=bucket.bucket).apply(
@@ -168,6 +172,14 @@ def make_issuer(tokens, bucket):
 
 
 bucket = s3_bucket("bucket", bucket_name)
+
+s3.BucketObject(
+    "test",
+    key="test",
+    bucket=bucket.id,
+    content="Hi there!\n",
+)
+
 tokens = dynamodb.Table(
     "tokens2",
     name="tokens",

@@ -1,9 +1,12 @@
 from configparser import ConfigParser
 from hashlib import sha256
+from functools import lru_cache
 from os import environ
 from traceback import format_exc
 from urllib.parse import urlencode
 from uuid import uuid4 as uuid
+from time import time
+from time import perf_counter_ns as perf_time
 import json
 
 from boto3.session import Session
@@ -18,6 +21,7 @@ parser = ConfigParser()
 parser.read(environ["LAMBDA_TASK_ROOT"] + "/config.ini")
 config = parser["default"]
 
+SYMMETRIC_KEY = "blah"
 COOKIE_MAX_AGE = 86400 * 365
 
 SESSION = BotocoreSession()
@@ -45,6 +49,28 @@ class OIDC:
         # TODO: implement
         pass
 
+def ttl_cache(fn):
+    cache = dict()
+    ordered = deque()
+
+    def expire():
+        at = time()
+        while len(ordered):
+            entry = ordered[0]
+            if entry["exp"] > at:
+                break
+
+            ordered.popleft()
+            del cache[key]
+
+    def wrapped(arg):
+        i
+        insort(
+
+        fn(arg)
+
+
+
 
 class TokenStorage:
     def __init__(self, table_name):
@@ -58,6 +84,8 @@ class TokenStorage:
         # data fields
         self.table.put_item(Item=dict(hashed_token=self._transform_pk(token), **values))
 
+    # TODO: convert to ttl cache?
+    @lru_cache(maxsize=65536)
     def get(self, token):
         resp = self.table.get_item(Key=dict(hashed_token=self._transform_pk(token)))
         try:
@@ -65,17 +93,9 @@ class TokenStorage:
         except KeyError:
             return None
 
-        return dict(
-            sub=item["sub"],
-            exp=int(item["exp"]),
-        )
+        item["exp"] = max(int(time()) + 61, item["exp"])
 
-    def get_sub(self, token):
-        resp = self.get(token)
-        if not resp:
-            return None
-        return resp["sub"]
-
+        return item
 
 
 tokens = TokenStorage(config["tokens_table"])
@@ -112,9 +132,16 @@ def _make_response(status, body, headers=None, **kwargs):
     )
 
 
-def _oidc_redirect(redirect_uri, cookies):
+def _oidc_redirect(request):
+    redirect_uri = _get_redirect_uri(request)
+    if not (auth_cookie := _get_auth_cookie(request)):
+        auth_cookie = uuid()
+
+    cookies = [f"a={auth_cookie}; Max-Age={COOKIE_MAX_AGE}; Secure; HttpOnly"]
+
     host = config["oidc_host"]
     client_id = config["client_id"]
+    # XXX: fix use of `state` parameter
     return _make_response(
         302,
         "",
@@ -142,26 +169,77 @@ def _get_redirect_uri(request):
 
 def _get_auth_cookie(request):
     cookies = _get_cookies(request)
-    try:
-        return cookies["a"]
-    except KeyError:
-        pass
-
-    return uuid()
+    return cookies.get("a")
 
 
-def redirect(request):
+def _whoami(request):
+    auth_cookie = _get_auth_cookie(request)
+    if auth_cookie is None:
+        return None
+
+    info = tokens.get(auth_cookie)
+    if info is None:
+        return None
+
+    return dict(
+        sub=info["sub"],
+        exp=int(info["exp"]),
+        iat=int(info["iat"]),
+    )
+
+
+def _refresh(request):
+    caller = _whoami(request)
+    if caller is None:
+        return None
+
+    if time() < caller["exp"]:
+        return caller
+
     redirect_uri = _get_redirect_uri(request)
+
     auth_cookie = _get_auth_cookie(request)
-    set_cookies = [f"a={auth_cookie}; Max-Age={COOKIE_MAX_AGE}; Secure; HttpOnly"]
+    token = tokens.get(auth_cookie)
 
-    return _oidc_redirect(redirect_uri, cookies=set_cookies)
+    resp = oidc.request_json(
+        "POST",
+        config["token_uri"],
+        headers={
+            "content-type": "application/x-www-form-urlencoded",
+        },
+        body=urlencode(
+            dict(
+                grant_type="refresh_token",
+                redirect_uri=redirect_uri,
+                client_id=config["client_id"],
+                client_secret=config["client_secret"],
+                refresh_token=token["refresh_token"],
+            )
+        ),
+    )
+
+    # Don't allow the refresh token to change
+    resp["refresh_token"] = token["refresh_token"]
+    return _store_idp_response(auth_cookie, resp)
 
 
-def whoami(request):
-    auth_cookie = _get_auth_cookie(request)
-    resp = tokens.get(auth_cookie)
-    return _make_response(200, resp)
+def _store_idp_response(auth_cookie, resp):
+    access_token = resp["access_token"]
+    decoded = jwt.decode(
+        access_token,
+        JWKS,
+        options=dict(verify_aud=False, verify_iss=False, verify_sub=False),
+    )
+
+    info = dict(
+        sub=decoded["sub"],
+        iat=decoded["iat"],
+        exp=decoded["exp"],
+        refresh_token=resp["refresh_token"],
+    )
+    tokens.put(auth_cookie, info)
+    del info["refresh_token"]
+    return info
 
 
 def store_token(request):
@@ -183,58 +261,66 @@ def store_token(request):
         ),
     )
 
-    tokens.put(resp.pop("refresh_token"), resp)
-
-    access_token = resp["access_token"]
-    decoded = jwt.decode(
-        access_token,
-        JWKS,
-        options=dict(verify_aud=False, verify_iss=False, verify_sub=False),
-    )
-    info = dict(sub=decoded["sub"], iat=decoded["iat"], exp=decoded["exp"])
     auth_cookie = _get_auth_cookie(request)
-    tokens.put(auth_cookie, info)
+    _store_idp_response(auth_cookie, resp)
 
-    data = jwt.encode(
-        info,
-        key="blah",
+    return _make_response(
+        302,
+        "",
+        dict(location="/whoami"),
     )
-    return _make_response(200, data)
 
 
 region = "us-west-2"
-path = "asset"
+
+
+def whoami(request):
+    return _make_response(200, _whoami(request))
 
 
 def asset(request):
-    auth_cookie = _get_auth_cookie(request)
-    resp = tokens.get(auth_cookie)
-    user = resp["sub"]
+    auth_info = _refresh(request)
+
+    if auth_info is None:
+        return _oidc_redirect(request)
+
+    user = auth_info["sub"]
+    path = request["rawPath"]
 
     bucket = config["bucket"]
     region = "us-west-2"
     credentials = load_credentials()
     auth = S3SigV4QueryAuth(credentials, "s3", region)
-    url = f"https://{bucket}.s3.{region}.amazonaws.com/{path}?user={user}"
+    url = f"https://{bucket}.s3.{region}.amazonaws.com{path}?user={user}"
     synthetic_request = AWSRequest(method="GET", url=url, headers=dict())
     auth.add_auth(synthetic_request)
     return _make_response(302, "", headers=dict(location=synthetic_request.url))
 
 
 ROUTES = {
-    "/": redirect,
     "/whoami": whoami,
-    "/asset": asset,
     "/auth": store_token,
 }
 
 
+def timer_middleware(fn):
+    def wrapper(*args, **kwargs):
+        start = perf_time()
+        result = fn(*args, **kwargs)
+        elapsed = perf_time() - start
+        result["headers"]["nanos"] = elapsed
+        return result
+
+    return wrapper
+
+
+@timer_middleware
 def _handler(request):
     route = ROUTES.get(request["rawPath"])
     if route is not None:
         return route(request)
 
-    return _make_response(404, "Not Found")
+    return asset(request)
 
 
 def lambda_handler(event, context):
